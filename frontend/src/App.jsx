@@ -43,7 +43,7 @@ export default function InvestmentResearchUI() {
     setResult(null);
 
     try {
-      const response = await fetch("http://localhost:3000/api/research", {
+      const response = await fetch("https://investment-research-bot-production.up.railway.app/api/research", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ question: query }),
