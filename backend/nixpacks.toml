@@ -1,0 +1,13 @@
+[phases.setup]
+nixPkgs = ["nodejs-18_x"]
+
+[phases.install]
+dependsOn = ["setup"]
+cmds = ["npm install --legacy-peer-deps"]
+
+[phases.build]
+dependsOn = ["install"]
+cmds = []
+
+[start]
+cmd = "npm start"
