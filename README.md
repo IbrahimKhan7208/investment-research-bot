@@ -16,6 +16,8 @@
 
 ---
 
+🚀 **[Try it live](https://investment-research-bot.vercel.app/)**
+
 ## 🎯 What This Is
 
 Most "AI finance chatbots" just wrap an LLM around a prompt. This is different.
