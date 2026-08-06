@@ -163,6 +163,6 @@ This metadata is what makes filtered retrieval possible — search is scoped to 
 
 <div align="center">
 
-**Built to understand production RAG systems from the ground up — one node at a time.**
+**Built to understand production RAG & LangGraph systems from the ground up — one node at a time.**
 
 </div>
