@@ -5,13 +5,15 @@ import { stdin as input, stdout as output } from "node:process";
 import { ChatGroq } from "@langchain/groq";
 import { z } from "zod";
 import { StateGraph } from "@langchain/langgraph";
-import { CohereEmbeddings } from "@langchain/cohere";
+import { CohereEmbeddings, CohereRerank } from "@langchain/cohere";
 import { PineconeStore } from "@langchain/pinecone";
 import { Pinecone as PineconeClient } from "@pinecone-database/pinecone";
 import { marked } from "marked";
 import TerminalRenderer from "marked-terminal";
 import { TavilySearch } from "@langchain/tavily";
 import { StockTool } from "./utils/stockTool.js";
+import { routeInvestmentQuestion } from "./utils/routerModel.js";
+import { resolveCik } from "./utils/secEdgar.js";
 import chalk from 'chalk';
 
 marked.setOptions({
@@ -24,7 +26,10 @@ const supportState = z.object({
   subQuestions: z.array(
     z.object({
       question: z.string(),
-      tool: z.array(z.enum(["RAG", "WEB", "STOCK"])),
+      tool: z.enum(["RAG", "WEB", "STOCK"]),
+      companies: z.array(z.string()),
+      years: z.array(z.number()),
+      searchQuery: z.string().optional(),
     }),
   ),
 
@@ -43,6 +48,8 @@ const supportState = z.object({
 
   toolsExecuted: z.array(z.string()).optional(),
 
+  agentTrace: z.array(z.record(z.any())).optional(),
+
   finalOutput: z.string().optional(),
 });
 
@@ -53,127 +60,27 @@ const smartLLM = new ChatGroq({
 });
 
 const fastLLM = new ChatGroq({
-  model: "llama-3.3-70b-versatile",
+  model: "openai/gpt-oss-20b",
   temperature: 0.1,
   maxRetries: 2,
 });
 
-async function extractFiltersFromQuestions(question) {
-  try {
-    const SYSTEM_PROMPT = `You extract structured search parameters from financial research questions.
-
-                          Question: "${question}"
-
-                          Available companies:
-                          - NVIDIA
-                          - AMD
-                          - Microsoft
-
-                          Available fiscal years:
-                          - 2024
-                          - 2025
-
-                          Your task:
-                          Extract which companies and years are relevant to the question,
-                          and produce a cleaned search query suitable for semantic retrieval.
-
-                          Rules:
-                          - Company names must be exactly: "NVIDIA", "AMD", or "Microsoft"
-                          - If multiple companies are mentioned, include all.
-                          - If the question implies "recent", "latest", or "most recent", include both 2024 and 2025.
-                          - Remove company names and years from the searchQuery.
-                          - Do NOT infer information not present in the question.
-
-                          Output format (STRICT JSON ONLY):
-                          {
-                            "companies": ["NVIDIA", "AMD", "Microsoft"],
-                            "years": [2024, 2025],
-                            "searchQuery": "string"
-                          }
-  `;
-
-    const response = await smartLLM.invoke([
-      { role: "system", content: SYSTEM_PROMPT },
-    ]);
-
-    const parsed = JSON.parse(response.content);
-
-    return parsed;
-  } catch {
-    return {
-      companies: ["NVIDIA", "AMD", "Microsoft"],
-      years: [2024, 2025],
-      searchQuery: question,
-    };
-  }
-}
-
 async function classifierNode(state) {
-  const SYSTEM_PROMPT = `You are a planning component in an AI investment research system.
+  const { subQuestions, requiredTools } = await routeInvestmentQuestion({
+    question: state.originalQuestion,
+  });
 
-                        Your responsibility is to ANALYZE the user's question and PRODUCE A PLAN.
-                        You do NOT answer questions.
-                        You do NOT retrieve information.
-                        You do NOT explain reasoning.
-
-                        Your tasks:
-                        1. Decompose the user's question into the MINIMUM number of factual sub-questions required to answer it accurately.
-                        2. Assign EXACTLY ONE tool to EACH sub-question.
-
-                        Available tools:
-                        - RAG
-                          Use when the answer can be found in internal documents only:
-                          NVIDIA, AMD, Microsoft 10-K filings (2024, 2025)
-
-                        - WEB
-                          Use when the question requires information outside those documents, such as:
-                          recent events
-                          analyst opinions
-                          news after filing dates
-
-                        - STOCK
-                          Use when the question involves:
-                          stock price
-                          market performance
-                          market cap
-                          trading volume
-
-                        Rules:
-                        - Each sub-question MUST use exactly ONE tool.
-                        - If a sub-question would require multiple tools, SPLIT it.
-                        - Sub-questions must be factual and specific (no explanations).
-                        - Generate ONLY necessary sub-questions (do not over-split).
-                        - Do NOT answer any sub-question.
-                        - Do NOT add commentary or reasoning.
-
-                        Output format (STRICT JSON ONLY):
-                        {
-                          "subQuestions": [
-                            {
-                              "question": "string",
-                              "tool": "RAG" | "WEB" | "STOCK"
-                            }
-                          ],
-                          "requiredTools": ["RAG", "WEB", "STOCK"]
-                        }
-  `;
-
-  const response = await smartLLM.invoke([
-    { role: "system", content: SYSTEM_PROMPT },
-    { role: "user", content: state.originalQuestion },
-  ]);
-
-  const parsed = JSON.parse(response.content);
   console.log(
     "\nTo answer this question, the following tools will be used: ",
-    parsed.requiredTools,
+    requiredTools,
   );
 
   return {
-    subQuestions: parsed.subQuestions,
-    requiredTools: parsed.requiredTools,
+    subQuestions,
+    requiredTools,
     toolsExecuted: [],
     evidence: [],
+    agentTrace: [],
   };
 }
 
@@ -185,6 +92,7 @@ async function ragNode(state) {
     apiKey: process.env.COHERE_API_KEY,
   });
 
+  const newTrace = [...(state.agentTrace || [])];
   const pinecone = new PineconeClient();
   const pineconeIndex = pinecone.Index(process.env.PINECONE_INDEX);
 
@@ -192,27 +100,104 @@ async function ragNode(state) {
     pineconeIndex,
   });
 
+  // xbrl-fact chunks are few (≤9 per company/year) and already precise —
+  // ground-truth numbers pulled straight from SEC's structured data, not
+  // parsed HTML. They get their own retrieval lane: fetch everything
+  // matching {company, year}, no vector-similarity competition, no rerank
+  // cutoff. Relying on vector search for these was the actual bug — a
+  // narrow top-K pool has no guarantee of surfacing a fact whose wording
+  // doesn't happen to match the query, even for a simple bare-fact lookup
+  // (confirmed: "What was Apple's revenue in FY2025?" failed to retrieve
+  // the Revenues fact for exactly this reason).
+  const MAX_XBRL_FACTS_PER_COMPANY_YEAR = 15; // effectively "all"
+
+  // narrative/table-prose is the large, genuinely noisy pool — this is
+  // where vector search + rerank actually earns its keep.
+  const CANDIDATES_PER_COMPANY_YEAR = 12;
+  const FINAL_NARRATIVE_CHUNKS_AFTER_RERANK = 6;
+
+  const reranker = new CohereRerank({
+    apiKey: process.env.COHERE_API_KEY,
+    model: "rerank-english-v3.0",
+    topN: FINAL_NARRATIVE_CHUNKS_AFTER_RERANK,
+  });
+
   const newEvidence = [...(state.evidence || [])];
+
+  // Presentation order only, applied after both lanes are merged.
+  const SOURCE_TYPE_PRIORITY = { "xbrl-fact": 0, "table-prose": 1, narrative: 2 };
 
   for (const subQ of state.subQuestions) {
     if (subQ.tool !== "RAG") continue;
 
-    const filters = await extractFiltersFromQuestions(subQ.question);
-    console.log(filters);
+    const companies = [];
+    for (const companyName of subQ.companies) {
+      const resolved = await resolveCik(companyName);
+      if (!resolved) {
+        console.warn(`   [RAG] Could not resolve "${companyName}" to a ticker — filtering on raw name, likely 0 results.`);
+      }
+      companies.push(resolved ? resolved.ticker : companyName);
+    }
 
-    const allChunks = [];
+    const currentYear = new Date().getFullYear();
+    const years = subQ.years.length > 0 ? subQ.years : [currentYear, currentYear - 1];
 
-    for (const company of filters.companies) {
-      for (const year of filters.years) {
-        const result = await vectorStore.similaritySearch(
-          filters.searchQuery,
-          3,
-          { company, year },
-        );
-        allChunks.push(...result);
+    const searchQuery = subQ.searchQuery || subQ.question;
+
+    // Lane 1: xbrl-fact — guaranteed, not vector-ranked
+    const xbrlFactChunks = [];
+    for (const company of companies) {
+      for (const year of years) {
+        const result = await vectorStore.similaritySearch(searchQuery, MAX_XBRL_FACTS_PER_COMPANY_YEAR, {
+          company,
+          year,
+          sourceType: "xbrl-fact",
+        });
+        xbrlFactChunks.push(...result);
       }
     }
-    console.log(chalk.green(`   Found ${allChunks.length} relevant chunks\n`));
+
+    const narrativeCandidates = [];
+    for (const company of companies) {
+      for (const year of years) {
+        let result = await vectorStore.similaritySearch(searchQuery, CANDIDATES_PER_COMPANY_YEAR, { company, year });
+        let narrative = result.filter((doc) => doc.metadata.sourceType !== "xbrl-fact");
+
+        // Narrative/table-prose chunks are tagged with the filing's own year, not
+        // every year they discuss — if we don't have that exact year ingested,
+        // fall back to a company-only search rather than returning nothing. The
+        // LLM sees each chunk's actual tagged year and can caveat accordingly.
+        if (narrative.length === 0) {
+          result = await vectorStore.similaritySearch(searchQuery, CANDIDATES_PER_COMPANY_YEAR, { company });
+          narrative = result.filter((doc) => doc.metadata.sourceType !== "xbrl-fact");
+        }
+
+        narrativeCandidates.push(...narrative);
+      }
+    }
+
+    console.log(
+      chalk.green(`   ${xbrlFactChunks.length} xbrl-fact chunks (guaranteed), ${narrativeCandidates.length} narrative/table-prose candidates, reranking...\n`)
+    );
+
+    const rerankedNarrative =
+      narrativeCandidates.length > 0
+        ? await reranker.compressDocuments(narrativeCandidates, subQ.question)
+        : [];
+
+    const allChunks = [...xbrlFactChunks, ...rerankedNarrative].sort(
+      (a, b) => SOURCE_TYPE_PRIORITY[a.metadata.sourceType] - SOURCE_TYPE_PRIORITY[b.metadata.sourceType]
+    );
+
+    newTrace.push({
+      node: "rag",
+      question: subQ.question,
+      xbrlFactCount: xbrlFactChunks.length,
+      narrativeCandidateCount: narrativeCandidates.length,
+      rerankedCount: rerankedNarrative.length,
+    });
+
+    console.log(chalk.green(`   ${allChunks.length} total chunks\n`));
 
     const SYSTEM_PROMPT = `You are a financial research assistant.
 
@@ -226,7 +211,7 @@ async function ragNode(state) {
                             ${allChunks
                               .map(
                                 (doc, i) => `
-                            [${i + 1}] ${doc.metadata.company} ${doc.metadata.year} (Page ${doc.metadata.page}):
+                            [${i + 1}] ${doc.metadata.company} ${doc.metadata.year} — ${doc.metadata.section} (${doc.metadata.sourceType}):
                             ${doc.pageContent}
                             `,
                               )
@@ -235,20 +220,14 @@ async function ragNode(state) {
                             Instructions:
                             - Provide the factual answer.
                             - Include specific figures when available.
-                            - Cite sources using this format: [Company Year, Page X].
+                            - If both an "xbrl-fact" and a "table-prose"/"narrative" excerpt give the same figure, prefer the xbrl-fact value — it comes from SEC's structured data, not parsed HTML.
+                            - Cite sources using this format: [Company Year, Section].
                             - Do NOT add opinions or analysis beyond the documents.
 
                             Answer:
     `;
 
-    const answerResponse = await fastLLM.invoke([
-      { role: "system", content: SYSTEM_PROMPT },
-    ]);
-
-    // console.log(
-    //   `Answer of ${allChunks[0].metadata.company}`,
-    //   answerResponse.content,
-    // );
+    const answerResponse = await fastLLM.invoke([{ role: "system", content: SYSTEM_PROMPT }]);
 
     newEvidence.push({
       question: subQ.question,
@@ -257,7 +236,10 @@ async function ragNode(state) {
       sources: allChunks.map((doc) => ({
         company: doc.metadata.company,
         year: doc.metadata.year,
-        page: doc.metadata.page,
+        section: doc.metadata.section,
+        sourceType: doc.metadata.sourceType,
+        formType: doc.metadata.formType,
+        filingDate: doc.metadata.filingDate,
       })),
     });
   }
@@ -265,12 +247,14 @@ async function ragNode(state) {
   return {
     evidence: newEvidence,
     toolsExecuted: [...(state.toolsExecuted || []), "RAG"],
+    agentTrace: newTrace,
   };
 }
 
 async function webNode(state) {
   console.log("\n[WEB] Searching web...");
 
+  const newTrace = [...(state.agentTrace || [])];
   const webTool = new TavilySearch({
     maxResults: 5,
     topic: "news",
@@ -283,8 +267,14 @@ async function webNode(state) {
   for (const subQ of state.subQuestions) {
     if (subQ.tool !== "WEB") continue;
 
-    const response = await webTool.invoke({ query: subQ.question });
+    const query = subQ.companies?.length
+      ? `${subQ.question} (${subQ.companies.join(", ")})`
+      : subQ.question;
+
+    const response = await webTool.invoke({ query });
     const searchResults = response.results.map((result) => result.content);
+
+    newTrace.push({ node: "web", question: subQ.question, query: subQ.question, articlesFound: searchResults.length });
 
     console.log(chalk.green(`   Retrieved ${searchResults.length} articles\n`));
 
@@ -315,12 +305,14 @@ async function webNode(state) {
   return {
     evidence: newEvidence,
     toolsExecuted: [...(state.toolsExecuted || []), "WEB"],
+    agentTrace: newTrace,
   };
 }
 
 async function stockNode(state) {
   console.log("\n[STOCK] Fetching market data...");
 
+  const newTrace = [...(state.agentTrace || [])];
   const stockTool = new StockTool();
   const newEvidence = [...(state.evidence || [])];
 
@@ -328,7 +320,9 @@ async function stockNode(state) {
     if (subQ.tool !== "STOCK") continue;
 
     try {
-      const stockData = await stockTool.answerQuestion(subQ.question);
+      const stockTrace = {};
+      const stockData = await stockTool.answerQuestion(subQ.question, subQ.companies, stockTrace);
+      newTrace.push({ node: "stock", question: subQ.question, ...stockTrace, resultCount: Array.isArray(stockData) ? stockData.length : 0 });
 
       if (!stockData || (Array.isArray(stockData) && stockData.length === 0)) {
         throw new Error("No data returned from API");
@@ -398,31 +392,8 @@ async function stockNode(state) {
   return {
     evidence: newEvidence,
     toolsExecuted: [...(state.toolsExecuted || []), "STOCK"],
+    agentTrace: newTrace,
   };
-}
-
-function _formatStockData(stockData) {
-  return stockData
-    .map((data, idx) => {
-      if (data.price) {
-        // Current price data
-        return `[${idx + 1}] ${data.ticker}
-          Current Price: $${data.price?.toFixed(2)} ${data.currency}
-          Change: ${data.change >= 0 ? "+" : ""}${data.change?.toFixed(2)} (${data.changePercent?.toFixed(2)}%)
-          Volume: ${data.volume?.toLocaleString()}
-          Market Cap: $${(data.marketCap / 1e9).toFixed(2)}B
-          Previous Close: $${data.previousClose?.toFixed(2)}`;
-      } else if (data.percentChange) {
-        // Historical performance data
-        return `[${idx + 1}] ${data.ticker} - ${data.period} Performance
-          Start Price: $${data.startPrice?.toFixed(2)}
-          End Price: $${data.endPrice?.toFixed(2)}
-          Price Change: ${data.priceChange >= 0 ? "+" : ""}$${data.priceChange?.toFixed(2)}
-          Percent Change: ${data.percentChange >= 0 ? "+" : ""}${data.percentChange}%
-          Data Points: ${data.data.length} days`;
-      }
-    })
-    .join("\n\n");
 }
 
 async function synthesizerNode(state) {

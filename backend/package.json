@@ -15,6 +15,7 @@
     "node": "18.x"
   },
   "dependencies": {
+    "@gradio/client": "^2.4.0",
     "@langchain/cohere": "1.0.1",
     "@langchain/community": "1.1.9",
     "@langchain/core": "1.1.17",
@@ -23,19 +24,16 @@
     "@langchain/pinecone": "1.0.1",
     "@langchain/tavily": "1.2.0",
     "@langchain/textsplitters": "1.0.1",
-
     "@pinecone-database/pinecone": "5.1.0",
-
     "chalk": "5.6.2",
+    "cheerio": "^1.2.0",
     "cors": "2.8.5",
-    "dotenv": "16.4.5",
-
+    "dotenv": "^16.4.5",
     "express": "4.21.2",
-
     "marked": "9.1.6",
     "marked-terminal": "6.0.0",
-
     "pdf-parse": "1.1.1",
+    "turndown": "^7.2.4",
     "yahoo-finance2": "3.13.0",
     "zod": "3.25.76"
   }

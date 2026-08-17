@@ -1,4 +1,4 @@
-import { StockTool } from './utils/stockTool.js';
+import { StockTool } from '../utils/stockTool.js';
 
 async function test() {
   const stockTool = new StockTool();

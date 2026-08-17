@@ -84,14 +84,14 @@ export class StockTool {
   /**
    * Answer stock-related questions
    */
-  async answerQuestion(question) {
-    const tickers = this._extractTickers(question);
+  async answerQuestion(question, companies = [], traceOut = {}) {
+    const tickers = companies.length > 0 ? await this._resolveTickers(companies) : this._extractTickers(question);
+    traceOut.tickers = tickers;
 
-    if (tickers.length === 0) {
-      return [];
-    }
+    if (tickers.length === 0) return [];
 
     const queryType = this._determineQueryType(question);
+    traceOut.queryType = queryType;
 
     const results = [];
 
@@ -103,6 +103,7 @@ export class StockTool {
 
       if (queryType === "performance" || queryType === "historical") {
         const period = this._extractPeriod(question);
+        traceOut.period = period;
         const histData = await this.getHistoricalData(ticker, period);
         if (histData) results.push(histData);
       }
@@ -180,6 +181,33 @@ export class StockTool {
     if (lowerQ.includes("week")) return "1wk";
 
     return "1y"; // Default
+  }
+
+  async _resolveTickers(companies) {
+    const tickers = [];
+
+    for (const company of companies) {
+      try {
+        const results = await yahooFinance.search(company);
+        const match = results?.quotes?.find(
+          (q) => q.quoteType === "EQUITY" && q.symbol,
+        );
+
+        if (match && !tickers.includes(match.symbol)) {
+          tickers.push(match.symbol);
+        }
+      } catch (error) {
+        console.error(`Failed to resolve ticker for "${company}":`, error.message);
+      }
+    }
+
+    // If Yahoo's search came up empty for everything, fall back to the
+    // old regex map on the raw company names — cheap safety net, not a real fix
+    if (tickers.length === 0) {
+      return this._extractTickers(companies.join(" "));
+    }
+
+    return tickers;
   }
 
   _getPeriodStartDate(period) {
