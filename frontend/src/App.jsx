@@ -24,7 +24,6 @@ const TICKERS = [
 ];
 
 const SAMPLE_QUERIES = [
-  "Compare Tesla and AMD's recent financials",
   "Analyze Tesla: recent financials, news sentiment, and stock performance",
   "What was Apple's operating margin last year?",
   "Compare NVIDIA and AMD's data center revenue growth and stock performance",

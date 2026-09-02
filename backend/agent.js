@@ -57,7 +57,6 @@ const AgentState = Annotation.Root({
   verifierAttempts: Annotation({ default: () => 0 }),
   gapFillRounds: Annotation({ default: () => 0 }),
 
-  // max-reducer: the worst any single sub-agent needed, not a sum.
   subAgentMaxAttempts: Annotation({
     reducer: (existing = 0, update = 0) => Math.max(existing, update),
     default: () => 0,
@@ -67,25 +66,52 @@ const AgentState = Annotation.Root({
 });
 
 // ─────────────────────────────────────────────────────────────────────────
-// STREAMING HELPERS — live progress emission during node execution.
-// `config.writer` is only present when the graph is invoked with
-// streamMode "custom" (the SSE endpoint). Plain graph.invoke() calls (the
-// CLI harness at the bottom of this file) never set it, so emit() is a
-// silent no-op there — nothing about the CLI path changes.
+// CROSS-COMPANY SCOPE GUARDS — the actual fix for this turn.
+//
+// Root cause: in a multi-company question, the router produces ONE
+// sub-question whose TEXT still names every company ("What was NVIDIA and
+// AMD's data center revenue growth..."), even though `companies` is
+// correctly split per sub-agent at dispatch. The retrieval FILTER was
+// already scoped correctly (each sub-agent only ever queries its own
+// company's vectors) — that part was never broken. What was broken: the
+// LOCAL VERIFIER was being shown the raw, unscoped originalQuestion when
+// checking a company's brief, so it would reasonably conclude "the
+// sibling company's data is missing" and generate a gap asking for it —
+// and that gap then got executed literally, as a real RAG/WEB call,
+// inside a scope where it could never possibly succeed. Every "provided
+// excerpts do not contain [other company]" answer in the evidence panel
+// is one of these — a real, paid retrieval + extraction call, guaranteed
+// to fail before it even ran.
+//
+// Two-layer fix:
+//  1. scopeQuestionToCompany — tell the verifier explicitly it's grading
+//     ONE company's brief only, so it stops generating the gap in the
+//     first place.
+//  2. gapMentionsOtherCompany — a hard backstop. Even a well-instructed
+//     model doesn't follow instructions 100% of the time; this drops any
+//     gap that slips through BEFORE it reaches a tool call, not after.
 // ─────────────────────────────────────────────────────────────────────────
 
-// Call this at the exact point something becomes true — timing here IS
-// the frontend's live-progress timing, same as console.log is for the
-// terminal. Silently no-ops outside a streaming context (POST /api/research).
+function scopeQuestionToCompany(questionText, company, allCompanies) {
+  const others = allCompanies.filter(c => c !== company);
+  if (others.length === 0) return questionText;
+  return `${questionText}\n\n(Note: this brief covers ${company} only. ${others.join(", ")} ${others.length > 1 ? "are" : "is"} covered in a separate, independent brief — do not treat missing ${others.join("/")} data as a gap in THIS brief, and do not request evidence about ${others.join("/")}. If ${others.join("/")} is mentioned in the retrieved evidence, that's incidental — judge only what this brief claims about ${company}.)`;
+}
+
+function gapMentionsOtherCompany(gap, otherCompanies) {
+  if (!otherCompanies?.length) return false;
+  const text = `${gap.missing || ""} ${gap.suggestedQuery || ""}`.toLowerCase();
+  return otherCompanies.some(c => text.includes(String(c).toLowerCase()));
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// STREAMING HELPERS
+// ─────────────────────────────────────────────────────────────────────────
+
 function emit(config, entry) {
   config?.writer?.(entry);
 }
 
-// Used inside subAgentNode: rag/web/stock/verifier calls made from within
-// a sub-agent emit plain node names ("rag", "verifying", ...) — this
-// wraps the writer so those get the same "subAgent:<company>:" prefix the
-// hand-written trace entries already use, so the frontend can route them
-// into the right company lane instead of the global ledger.
 function scopedConfig(config, company) {
   if (!config?.writer) return config;
   return {
@@ -122,11 +148,7 @@ const verifierLLM = new ChatGoogleGenerativeAI({
 });
 
 // ─────────────────────────────────────────────────────────────────────────
-// SHARED CLIENTS — hoisted to module scope. Previously every ragNode call
-// (and every parallel sub-agent's ragNode call) built its own
-// CohereEmbeddings/Pinecone/CohereRerank/TavilySearch/StockTool from
-// scratch. Harmless for one company, wasteful and rate-limit-risky once
-// several sub-agents fire concurrently via Send. One instance, reused.
+// SHARED CLIENTS
 // ─────────────────────────────────────────────────────────────────────────
 
 const MAX_XBRL_FACTS_PER_COMPANY_YEAR = 15;
@@ -190,11 +212,7 @@ async function classifierNode(state, config) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// TOOL NODES — error-contained on all three (RAG/WEB match STOCK's
-// pre-existing pattern). A failed retrieval becomes a visible "unable to
-// retrieve" evidence entry instead of an uncaught exception killing the
-// whole graph.invoke() call, including sibling sub-agents that already
-// finished cleanly.
+// TOOL NODES
 // ─────────────────────────────────────────────────────────────────────────
 
 async function ragNode(state, config) {
@@ -493,9 +511,7 @@ Answer:`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// SOURCE APPENDIX — walks `evidence` in the same order buildEvidenceBlock
-// used to assign [W#] tags, so in-text citations and this list always
-// agree. Do not reorder/filter differently from buildEvidenceBlock's walk.
+// SOURCE APPENDIX
 // ─────────────────────────────────────────────────────────────────────────
 
 function renderSourceAppendix(evidence) {
@@ -509,8 +525,7 @@ function renderSourceAppendix(evidence) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// SINGLE-ENTITY SYNTHESIS + VERIFICATION PATH — also now where the
-// multi-entity merge output (finalizeMultiEntityNode) gets verified.
+// SINGLE-ENTITY SYNTHESIS + VERIFICATION PATH
 // ─────────────────────────────────────────────────────────────────────────
 
 async function synthesizerNode(state) {
@@ -568,9 +583,6 @@ async function verifierNode(state, config) {
   };
 }
 
-// gapFillNode — evidence: [] (delta), not state.evidence (full snapshot),
-// same as before. `config` is now threaded into the ragNode/webNode/
-// stockNode calls it makes so gap-fill retrieval streams live too.
 async function gapFillNode(state, config) {
   console.log("\n[GAP-FILL] Re-invoking tools for evidence gaps...\n");
   emit(config, { node: "gapFill", phase: "start" });
@@ -609,7 +621,7 @@ async function gapFillNode(state, config) {
     ({ node: "gapFill:abandoned", gap: g.missing, reason: `already tried ${g.suggestedTool}, no further tool to escalate to` }));
 
   return {
-    evidence: working.evidence,   // delta only — the graph reducer concats
+    evidence: working.evidence,
     agentTrace: [...working.agentTrace, ...escalationTrace, ...abandonedTrace],
     toolsExecuted: working.toolsExecuted,
     verifierAttempts: (state.verifierAttempts || 0) + 1,
@@ -617,12 +629,6 @@ async function gapFillNode(state, config) {
   };
 }
 
-// Phase 3: unsupported_claim / conflicting_evidence remedy. Does NOT
-// re-retrieve — the evidence was fine, the synthesis step misused it.
-// Shared by both paths — it corrects state.finalOutput in place regardless
-// of whether that output came from synthesizerNode or
-// finalizeMultiEntityNode, so no branching needed here the way gapFill
-// needs it.
 async function resynthesizeNode(state, config) {
   console.log(chalk.magenta("\n[RESYNTHESIZE] Correcting previous answer...\n"));
   emit(config, { node: "resynthesize", phase: "start" });
@@ -742,16 +748,19 @@ Brief:`;
   return response.content;
 }
 
-// One sub-agent, one company. `config` is scoped via scopedConfig so every
-// emit() inside this function (and inside the ragNode/webNode/stockNode
-// calls it makes) automatically gets prefixed "subAgent:<company>:" —
-// lets the frontend route these into the right company lane.
+// One sub-agent, one company. `scopedQuestion` and `otherCompanies` are new
+// — see the header comment on scopeQuestionToCompany/gapMentionsOtherCompany
+// for why. `originalQuestion` is kept for the brief-writing prompt (its own
+// instructions already restrict scope: "producing a brief on {company}
+// only"), but `scopedQuestion` — NOT `originalQuestion` — is what the local
+// verifier is graded against, since that's the one place the cross-company
+// gap was actually being generated.
 async function subAgentNode(payload, config) {
-  const { company, subQuestions, originalQuestion, runStartTime } = payload;
+  const { company, subQuestions, originalQuestion, scopedQuestion, otherCompanies, runStartTime } = payload;
   console.log(chalk.cyan(`\n[SUB-AGENT: ${company}] Starting...\n`));
 
   const cfg = scopedConfig(config, company);
-  emit(cfg, { node: "starting" }); // → "subAgent:<company>:starting"
+  emit(cfg, { node: "starting" });
 
   let local = { subQuestions, evidence: [], agentTrace: [], toolsExecuted: [] };
   const neededTools = [...new Set(subQuestions.map(q => q.tool))];
@@ -772,12 +781,12 @@ async function subAgentNode(payload, config) {
   let gapRoundsLocal = 0;
 
   while (true) {
-    emit(cfg, { node: "verifying" }); // → "subAgent:<company>:verifying"
+    emit(cfg, { node: "verifying" });
 
     const verdict = await guardedVerify({
       llm: verifierLLM,
       mode: "local",
-      question: originalQuestion,
+      question: scopedQuestion || originalQuestion, // ← the actual fix: verifier now grades against a question that explicitly excludes the sibling company
       company,
       evidenceBundle: local.evidence,
       draftText: briefText,
@@ -789,7 +798,7 @@ async function subAgentNode(payload, config) {
       reasoning: verdict.reasoning,
     };
     local.agentTrace.push(verdictEntry);
-    emit(config, verdictEntry); // unscoped — already fully prefixed
+    emit(config, verdictEntry);
 
     console.log(chalk.yellow(`   [${company}] verdict: ${verdict.verdict}`));
 
@@ -814,7 +823,30 @@ async function subAgentNode(payload, config) {
 
     if (verdict.verdict === "needs_more_evidence") {
       gapRoundsLocal++;
-      const planned = planGapRetrieval(verdict.evidenceGaps || [], gapRoundsLocal);
+
+      // Backstop: drop any gap that asks about a sibling company BEFORE it
+      // ever reaches a tool call. This is what stops the exact waste seen
+      // in production — a gap literally titled "NVIDIA FY2024 data center
+      // revenue growth" being executed inside AMD's own scoped retrieval,
+      // guaranteed to return "not found" every time.
+      const rawGaps = verdict.evidenceGaps || [];
+      const inScopeGaps = rawGaps.filter(g => !gapMentionsOtherCompany(g, otherCompanies));
+      const outOfScopeGaps = rawGaps.filter(g => gapMentionsOtherCompany(g, otherCompanies));
+
+      outOfScopeGaps.forEach(g => {
+        const e = { node: `subAgent:${company}:abandoned`, gap: g.missing, reason: "out of scope — belongs to another company's brief, not retried" };
+        local.agentTrace.push(e);
+        emit(config, e);
+      });
+
+      if (inScopeGaps.length === 0) {
+        // The entire "gap" was a cross-company artifact — nothing real is
+        // actually missing from THIS brief. Stop here instead of spending
+        // another round chasing nothing.
+        break;
+      }
+
+      const planned = planGapRetrieval(inScopeGaps, gapRoundsLocal);
       const abandoned = planned.filter(g => g.giveUp);
       const toRun = planned.filter(g => !g.giveUp);
 
@@ -909,12 +941,6 @@ async function globalCheckNode(state, config) {
   };
 }
 
-// Routes into the SAME verifier loop the single-entity path uses (see the
-// "finalizeMultiEntity" -> "verifier" edge below). Per-company briefs and
-// cross-brief coherence were already checked upstream — this is what
-// checks the merge itself, which is where a real unit error (a brief's
-// correct "$3,694 million" rendered as "$3.694 M" in the merged table)
-// slipped through undetected before this edge existed.
 async function finalizeMultiEntityNode(state, config) {
   console.log("\n[FINALIZE] Merging company briefs into final answer...\n");
   emit(config, { node: "finalizeMultiEntity", phase: "start" });
@@ -958,22 +984,28 @@ Final Answer:`;
 // ─────────────────────────────────────────────────────────────────────────
 
 function routeAfterClassifier(state) {
-  const uniqueCompanies = new Set(state.subQuestions.flatMap(q => q.companies));
+  const uniqueCompanies = [...new Set(state.subQuestions.flatMap(q => q.companies))];
 
-  if (uniqueCompanies.size > 1) {
+  if (uniqueCompanies.length > 1) {
     const byCompany = {};
     for (const q of state.subQuestions) {
       const companies = q.companies.length ? q.companies : ["_general"];
       for (const c of companies) {
         byCompany[c] = byCompany[c] || [];
-        byCompany[c].push({ ...q, companies: [c] });
+        byCompany[c].push({
+          ...q,
+          companies: [c],
+          question: scopeQuestionToCompany(q.question, c, uniqueCompanies),
+        });
       }
     }
-    return Object.entries(byCompany).map(([company, qs]) =>
+    return uniqueCompanies.map((company) =>
       new Send("subAgent", {
         company,
-        subQuestions: qs,
+        subQuestions: byCompany[company] || [],
         originalQuestion: state.originalQuestion,
+        scopedQuestion: scopeQuestionToCompany(state.originalQuestion, company, uniqueCompanies),
+        otherCompanies: uniqueCompanies.filter(c => c !== company),
         runStartTime: state.runStartTime,
       })
     );
@@ -1018,11 +1050,6 @@ function routeAfterVerifier(state) {
   return "__end__";
 }
 
-// gapFill is now shared by both paths. Send its updated evidence back to
-// whichever synthesis step actually knows how to use it — the generic
-// single-entity synthesizer, or the multi-entity merge step (which carries
-// per-company-brief structure and the scale-preservation instruction that
-// the generic synthesizer's context doesn't have reason to repeat).
 function routeAfterGapFill(state) {
   if ((state.companyBriefs || []).length > 1) return "finalizeMultiEntity";
   return "synthesizer";
